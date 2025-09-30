@@ -1,0 +1,150 @@
+<?xml version="1.0"?>
+<robot name="d435i_gazebo" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  
+  <!-- D435i properties -->
+  <xacro:property name="M_PI" value="3.1415926535897931" />
+  <xacro:property name="d435_cam_width" value="0.090"/>
+  <xacro:property name="d435_cam_height" value="0.025"/>
+  <xacro:property name="d435_cam_depth" value="0.02505"/>
+  <xacro:property name="d435_cam_mount_from_center_offset" value="0.0149"/>
+  <xacro:property name="d435_glass_to_front" value="0.1e-3"/>
+  <xacro:property name="d435_zero_depth_to_glass" value="4.2e-3"/>
+  <xacro:property name="d435_mesh_x_offset" value="${d435_cam_mount_from_center_offset-d435_glass_to_front-d435_zero_depth_to_glass}"/>
+  <xacro:property name="d435_cam_depth_px" value="${d435_cam_mount_from_center_offset}"/>
+  <xacro:property name="d435_cam_depth_py" value="0.0175"/>
+  <xacro:property name="d435_cam_depth_pz" value="${d435_cam_height/2}"/>
+  <xacro:property name="d435_cam_depth_to_color_offset" value="0.015"/>
+
+  <!-- Material definitions -->
+  <material name="aluminum">
+    <color rgba="0.5 0.5 0.5 1"/>
+  </material>
+
+  <!-- Define the D435i with Gazebo plugin -->
+  <xacro:macro name="d435i_gazebo" params="parent *origin name:=camera use_mesh:=true">
+    
+    <!-- camera body -->
+    <joint name="${name}_joint" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${name}_link" />
+      <xacro:insert_block name="origin" />
+    </joint>
+
+    <link name="${name}_link">
+      <xacro:if value="${use_mesh}">
+        <visual>
+          <!-- the mesh origin is at front plate in between the two infrared camera axes -->
+          <origin xyz="${d435_zero_depth_to_glass + d435_glass_to_front} ${-d435_cam_depth_py} 0" rpy="${M_PI/2} 0 ${M_PI/2}"/>
+          <geometry>
+            <mesh filename="package://d435i_gazebo/meshes/d435.dae" />
+          </geometry>
+        </visual>
+        <collision>
+          <origin xyz="0 ${-d435_cam_depth_py} 0" rpy="0 0 0"/>
+          <geometry>
+            <box size="${d435_cam_depth} ${d435_cam_width} ${d435_cam_height}"/>
+          </geometry>
+        </collision>
+        <inertial>
+          <mass value="0.072" />
+          <origin xyz="0 0 0" />
+          <inertia ixx="0.003881243" ixy="0.0" ixz="0.0" iyy="0.000498940" iyz="0.0" izz="0.003879257" />
+        </inertial>
+      </xacro:if>  
+    </link>
+
+    <!-- Camera depth joints and links -->
+    <joint name="${name}_depth_joint" type="fixed">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <parent link="${name}_link"/>
+      <child link="${name}_depth_frame" />
+    </joint>
+    <link name="${name}_depth_frame"/>
+
+    <joint name="${name}_depth_optical_joint" type="fixed">
+      <origin xyz="0 0 0" rpy="${-M_PI/2} 0 ${-M_PI/2}" />
+      <parent link="${name}_depth_frame" />
+      <child link="${name}_depth_optical_frame" />
+    </joint>
+    <link name="${name}_depth_optical_frame"/>
+
+    <!-- Camera color joints and links -->
+    <joint name="${name}_color_joint" type="fixed">
+      <origin xyz="0 ${d435_cam_depth_to_color_offset} 0" rpy="0 0 0" />
+      <parent link="${name}_link" />
+      <child link="${name}_color_frame" />
+    </joint>
+    <link name="${name}_color_frame"/>
+
+    <joint name="${name}_color_optical_joint" type="fixed">
+      <origin xyz="0 0 0" rpy="${-M_PI/2} 0 ${-M_PI/2}" />
+      <parent link="${name}_color_frame" />
+      <child link="${name}_color_optical_frame" />
+    </joint>
+    <link name="${name}_color_optical_frame"/>
+
+    <!-- Gazebo sensor definitions -->
+    <gazebo reference="${name}_link">
+      <!-- Color camera -->
+      <sensor type="camera" name="color">
+        <always_on>true</always_on>
+        <update_rate>30.0</update_rate>
+        <camera name="color">
+          <horizontal_fov>1.047</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>360</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.02</near>
+            <far>10</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.007</stddev>
+          </noise>
+        </camera>
+        <pose>0 ${d435_cam_depth_to_color_offset} 0 0 0 0</pose>
+      </sensor>
+
+      <!-- Depth camera -->
+      <sensor type="depth" name="depth">
+        <always_on>true</always_on>
+        <update_rate>30.0</update_rate>
+        <camera name="depth">
+          <horizontal_fov>1.047</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>360</height>
+          </image>
+          <clip>
+            <near>0.02</near>
+            <far>10</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.1</stddev>
+          </noise>
+        </camera>
+        <pose>0 0 0 0 0 0</pose>
+      </sensor>
+    </gazebo>
+
+    <!-- D435i Gazebo plugin (model scoped) -->
+    <gazebo>
+      <plugin name="${name}_controller" filename="libd435i_gazebo_plugin.so">
+        <robotNamespace></robotNamespace>
+        <cameraName>${name}</cameraName>
+        <colorFrameId>${name}_color_optical_frame</colorFrameId>
+        <depthFrameId>${name}_depth_optical_frame</depthFrameId>
+        <updateRate>30.0</updateRate>
+        <prefix>${name}_link::</prefix>
+      </plugin>
+    </gazebo>
+
+  </xacro:macro>
+
+</robot>

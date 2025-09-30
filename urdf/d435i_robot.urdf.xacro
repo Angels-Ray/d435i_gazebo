@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<robot name="d435i_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  
+  <!-- Include the D435i Gazebo macro -->
+  <xacro:include filename="$(find d435i_gazebo)/urdf/d435i_gazebo.urdf.xacro"/>
+  
+  <!-- Base link -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.1 0.1 0.1"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0 0 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.1 0.1 0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  
+  <!-- Add the D435i camera -->
+  <xacro:d435i_gazebo parent="base_link" name="camera" use_mesh="true">
+    <origin xyz="${d435_mesh_x_offset} ${d435_cam_depth_py} ${0.15 + d435_cam_depth_pz}" rpy="0 0 0"/>
+  </xacro:d435i_gazebo>
+  
+</robot>
