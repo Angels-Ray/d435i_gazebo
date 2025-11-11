@@ -12,7 +12,7 @@ namespace gazebo
     , nh_(nullptr)
     , it_(nullptr)
     , initialized_(false)
-    , update_rate_(30.0)
+    , params_initialized_(false)
   {
   }
 
@@ -64,9 +64,6 @@ namespace gazebo
     if (_sdf->HasElement("depthFrameId"))
       depth_frame_id_ = _sdf->Get<std::string>("depthFrameId");
 
-    if (_sdf->HasElement("updateRate"))
-      update_rate_ = _sdf->Get<double>("updateRate");
-
     std::string sdf_prefix;
     if (_sdf->HasElement("prefix"))
       sdf_prefix = _sdf->Get<std::string>("prefix");
@@ -113,6 +110,10 @@ namespace gazebo
     nh_ = new ros::NodeHandle(robot_namespace_);
     it_ = new image_transport::ImageTransport(*nh_);
 
+    // Initialize TF2 listener
+    tf_buffer_.reset(new tf2_ros::Buffer());
+    tf_listener_.reset(new tf2_ros::TransformListener(*tf_buffer_));
+
     const std::string color_ns = camera_name_ + "/color";
     const std::string depth_ns = camera_name_ + "/depth";
     
@@ -124,10 +125,6 @@ namespace gazebo
     color_pub_ = it_->advertiseCamera(color_topic, 1);
     depth_pub_ = it_->advertiseCamera(depth_topic, 1);
     aligned_depth_pub_ = it_->advertiseCamera(aligned_depth_topic, 1);
-
-    // Initialize camera info managers with namespaced node handles to avoid /set_camera_info collisions
-    color_info_manager_.reset(new camera_info_manager::CameraInfoManager(ros::NodeHandle(*nh_, color_ns), camera_name_ + "_color"));
-    depth_info_manager_.reset(new camera_info_manager::CameraInfoManager(ros::NodeHandle(*nh_, depth_ns), camera_name_ + "_depth"));
 
     // Get sensors through sensor manager
     sensors::SensorManager* sensor_manager = sensors::SensorManager::Instance();
@@ -201,6 +198,7 @@ namespace gazebo
     // Initialize depth map
     try {
       depth_map_.resize(depth_cam_->ImageWidth() * depth_cam_->ImageHeight());
+      aligned_depth_map_.resize(color_cam_->ImageWidth() * color_cam_->ImageHeight());
     } catch (std::bad_alloc &e) {
       ROS_ERROR("D435iGazeboPlugin: depthMap allocation failed: %s", e.what());
       return;
@@ -213,35 +211,25 @@ namespace gazebo
     depth_connection_ = depth_cam_->ConnectNewDepthFrame(
         std::bind(&D435iGazeboPlugin::OnNewDepthFrame, this));
 
-    // Connect to world update
-    update_connection_ = event::Events::ConnectWorldUpdateBegin(
-        std::bind(&D435iGazeboPlugin::OnUpdate, this));
-
-    last_update_time_ = world_->SimTime();
     initialized_ = true;
 
     ROS_INFO("D435i Gazebo plugin initialized successfully!");
-  }
-
-  void D435iGazeboPlugin::OnUpdate()
-  {
-    if (!initialized_)
-      return;
-
-    common::Time current_time = world_->SimTime();
-    double dt = (current_time - last_update_time_).Double();
-
-    if (dt >= 1.0 / update_rate_)
-    {
-      last_update_time_ = current_time;
-      // Update logic if needed
-    }
   }
 
   void D435iGazeboPlugin::OnNewColorFrame()
   {
     if (!initialized_ || !color_cam_)
       return;
+
+    // Initialize camera parameters on first call
+    if (!params_initialized_)
+    {
+      if (!InitializeCameraParameters())
+      {
+        ROS_ERROR_THROTTLE(5.0, "Failed to initialize camera parameters. Cannot publish images.");
+        return;
+      }
+    }
 
     // Get current time
     common::Time current_time = world_->SimTime();
@@ -260,11 +248,11 @@ namespace gazebo
                           color_cam_->ImageDepth() * color_cam_->ImageWidth(),
                           reinterpret_cast<const void*>(color_cam_->ImageData()));
 
-    // Generate camera info
-    auto color_info = CameraInfo(color_msg_, color_cam_->HFOV().Radian());
+    // Use cached camera info (only update timestamp)
+    color_camera_info_.header = color_msg_.header;
     
     // Publish color image with camera info
-    color_pub_.publish(color_msg_, color_info);
+    color_pub_.publish(color_msg_, color_camera_info_);
   }
 
   void D435iGazeboPlugin::OnNewDepthFrame()
@@ -272,14 +260,23 @@ namespace gazebo
     if (!initialized_ || !depth_cam_)
       return;
 
+    // Initialize camera parameters on first call
+    if (!params_initialized_)
+    {
+      if (!InitializeCameraParameters())
+      {
+        ROS_ERROR_THROTTLE(5.0, "Failed to initialize camera parameters. Cannot publish images.");
+        return;
+      }
+    }
+
     // Get current time
     common::Time current_time = world_->SimTime();
 
-    // Get depth map dimensions
-    unsigned int imageSize = depth_cam_->ImageWidth() * depth_cam_->ImageHeight();
-
     // Convert Float depth data to RealSense depth data
     const float* depthDataFloat = depth_cam_->DepthData();
+    const unsigned int imageSize = depth_width_ * depth_height_;
+    
     for (unsigned int i = 0; i < imageSize; ++i) {
       // Check clipping and overflow  
       if (depthDataFloat[i] < 0.2f ||  // rangeMinDepth
@@ -303,63 +300,282 @@ namespace gazebo
                           2 * depth_cam_->ImageWidth(),
                           reinterpret_cast<const void*>(depth_map_.data()));
 
-    // Generate camera info
-    auto depth_info = CameraInfo(depth_msg_, depth_cam_->HFOV().Radian());
+    // Use cached camera info (only update timestamp)
+    depth_camera_info_.header = depth_msg_.header;
     
     // Publish depth image with camera info
-    depth_pub_.publish(depth_msg_, depth_info);
+    depth_pub_.publish(depth_msg_, depth_camera_info_);
 
     // Generate and publish aligned depth to color
     GenerateAlignedDepthToColor();
   }
 
+  bool D435iGazeboPlugin::InitializeCameraParameters()
+  {
+    if (params_initialized_)
+      return true;
+
+    ROS_INFO("Initializing camera parameters from Gazebo simulation...");
+
+    // Get intrinsics directly from Gazebo camera sensors
+    if (!depth_cam_ || !color_cam_)
+    {
+      ROS_ERROR("Camera sensors not initialized!");
+      return false;
+    }
+
+    // Calculate depth camera intrinsics from Gazebo camera properties
+    depth_width_ = depth_cam_->ImageWidth();
+    depth_height_ = depth_cam_->ImageHeight();
+    double depth_hfov = depth_cam_->HFOV().Radian();
+    
+    depth_fx_ = 0.5 * depth_width_ / tan(0.5 * depth_hfov);
+    depth_fy_ = depth_fx_; // Assuming square pixels
+    depth_cx_ = depth_width_ * 0.5;
+    depth_cy_ = depth_height_ * 0.5;
+    
+    ROS_INFO("Calculated depth camera intrinsics from Gazebo: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f",
+             depth_fx_, depth_fy_, depth_cx_, depth_cy_);
+
+    // Calculate color camera intrinsics from Gazebo camera properties
+    color_width_ = color_cam_->ImageWidth();
+    color_height_ = color_cam_->ImageHeight();
+    double color_hfov = color_cam_->HFOV().Radian();
+    
+    color_fx_ = 0.5 * color_width_ / tan(0.5 * color_hfov);
+    color_fy_ = color_fx_; // Assuming square pixels
+    color_cx_ = color_width_ * 0.5;
+    color_cy_ = color_height_ * 0.5;
+    
+    ROS_INFO("Calculated color camera intrinsics from Gazebo: fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f",
+             color_fx_, color_fy_, color_cx_, color_cy_);
+
+    // Get extrinsics from TF (must be published by robot_state_publisher or static_transform_publisher)
+    if (!tf_buffer_)
+    {
+      ROS_ERROR("TF buffer not initialized!");
+      return false;
+    }
+
+    try
+    {
+      // Get transform from depth optical frame to color optical frame
+      geometry_msgs::TransformStamped transform_stamped = tf_buffer_->lookupTransform(
+          color_frame_id_, depth_frame_id_, ros::Time(0), ros::Duration(2.0));
+
+      // Extract translation
+      tx_ = transform_stamped.transform.translation.x;
+      ty_ = transform_stamped.transform.translation.y;
+      tz_ = transform_stamped.transform.translation.z;
+
+      ROS_INFO("Loaded camera extrinsics from TF: tx=%.4f, ty=%.4f, tz=%.4f", tx_, ty_, tz_);
+
+      // Warn if there's rotation (we only use translation)
+      const auto& q = transform_stamped.transform.rotation;
+      bool has_rotation = (fabs(q.x) > 1e-3 || fabs(q.y) > 1e-3 || 
+                          fabs(q.z) > 1e-3 || fabs(q.w - 1.0) > 1e-3);
+      if (has_rotation)
+      {
+        ROS_WARN("Rotation detected between depth and color frames (qx=%.4f, qy=%.4f, qz=%.4f, qw=%.4f). "
+                 "Current implementation uses translation-only alignment.", q.x, q.y, q.z, q.w);
+      }
+    }
+    catch (tf2::TransformException& ex)
+    {
+      ROS_ERROR("Failed to get TF transform from %s to %s: %s",
+                depth_frame_id_.c_str(), color_frame_id_.c_str(), ex.what());
+      ROS_ERROR("Make sure robot_state_publisher is running and URDF is properly loaded!");
+      return false;
+    }
+
+    // Create and cache CameraInfo messages (these are static)
+    depth_camera_info_ = CreateCameraInfoMsg(depth_width_, depth_height_, 
+                                             depth_fx_, depth_fy_, depth_cx_, depth_cy_,
+                                             depth_frame_id_);
+    
+    color_camera_info_ = CreateCameraInfoMsg(color_width_, color_height_,
+                                             color_fx_, color_fy_, color_cx_, color_cy_,
+                                             color_frame_id_);
+    
+    aligned_camera_info_ = CreateCameraInfoMsg(color_width_, color_height_,
+                                               color_fx_, color_fy_, color_cx_, color_cy_,
+                                               color_frame_id_);
+
+    params_initialized_ = true;
+    ROS_INFO("Camera parameters initialized successfully from simulation!");
+    return true;
+  }
+
   void D435iGazeboPlugin::GenerateAlignedDepthToColor()
   {
-    if (!color_cam_ || !depth_cam_)
+    if (!color_cam_ || !depth_cam_ || !params_initialized_)
       return;
 
     // Get current time
     common::Time current_time = world_->SimTime();
 
-    // Create aligned depth image using color camera frame
+    // Initialize aligned depth map with zeros
+    std::fill(aligned_depth_map_.begin(), aligned_depth_map_.end(), 0);
+
+    // Track the actual bounds of projected depth data for optimized hole filling
+    unsigned int min_u = color_width_, max_u = 0;
+    unsigned int min_v = color_height_, max_v = 0;
+
+    // For each pixel in the depth image
+    for (unsigned int v = 0; v < depth_height_; ++v)
+    {
+      const unsigned int row_offset = v * depth_width_;
+      
+      for (unsigned int u = 0; u < depth_width_; ++u)
+      {
+        const uint16_t depth_value = depth_map_[row_offset + u];
+
+        if (depth_value == 0)
+          continue; // Skip invalid depth
+
+        // Convert depth value to meters
+        const float depth_m = depth_value * DEPTH_SCALE_M;
+
+        // Back-project depth pixel to 3D point in depth camera frame
+        const float x_depth = (u - depth_cx_) * depth_m / depth_fx_;
+        const float y_depth = (v - depth_cy_) * depth_m / depth_fy_;
+
+        // Transform 3D point from depth frame to color frame (translation only)
+        const float x_color = x_depth + tx_;
+        const float y_color = y_depth + ty_;
+        const float z_color = depth_m + tz_;
+
+        // Project 3D point to color camera image plane
+        if (z_color <= 0)
+          continue; // Point is behind the color camera
+
+        const int u_color_int = static_cast<int>((x_color * color_fx_ / z_color) + color_cx_ + 0.5);
+        const int v_color_int = static_cast<int>((y_color * color_fy_ / z_color) + color_cy_ + 0.5);
+
+        // Check if the projected point is within the color image bounds
+        if (u_color_int >= 0 && u_color_int < static_cast<int>(color_width_) &&
+            v_color_int >= 0 && v_color_int < static_cast<int>(color_height_))
+        {
+          const unsigned int aligned_idx = v_color_int * color_width_ + u_color_int;
+
+          // Handle occlusion: keep the closest depth value
+          if (aligned_depth_map_[aligned_idx] == 0 || depth_value < aligned_depth_map_[aligned_idx])
+          {
+            aligned_depth_map_[aligned_idx] = depth_value;
+            
+            // Update bounds for hole filling optimization
+            if (u_color_int < static_cast<int>(min_u)) min_u = u_color_int;
+            if (u_color_int > static_cast<int>(max_u)) max_u = u_color_int;
+            if (v_color_int < static_cast<int>(min_v)) min_v = v_color_int;
+            if (v_color_int > static_cast<int>(max_v)) max_v = v_color_int;
+          }
+        }
+      }
+    }
+
+    // Optimized hole filling: only process the region with actual depth data
+    // Add 1-pixel border for edge cases
+    const unsigned int fill_min_v = (min_v > 1) ? min_v - 1 : 1;
+    const unsigned int fill_max_v = (max_v < color_height_ - 2) ? max_v + 1 : color_height_ - 2;
+    const unsigned int fill_min_u = (min_u > 1) ? min_u - 1 : 1;
+    const unsigned int fill_max_u = (max_u < color_width_ - 2) ? max_u + 1 : color_width_ - 2;
+
+    for (unsigned int v = fill_min_v; v <= fill_max_v; ++v)
+    {
+      const unsigned int row_offset = v * color_width_;
+      
+      for (unsigned int u = fill_min_u; u <= fill_max_u; ++u)
+      {
+        const unsigned int idx = row_offset + u;
+        
+        if (aligned_depth_map_[idx] == 0)
+        {
+          // Check 4-connected neighbors and average non-zero values
+          const uint16_t top = aligned_depth_map_[idx - color_width_];
+          const uint16_t bottom = aligned_depth_map_[idx + color_width_];
+          const uint16_t left = aligned_depth_map_[idx - 1];
+          const uint16_t right = aligned_depth_map_[idx + 1];
+          
+          uint32_t sum = 0;
+          int count = 0;
+          
+          if (top) { sum += top; ++count; }
+          if (bottom) { sum += bottom; ++count; }
+          if (left) { sum += left; ++count; }
+          if (right) { sum += right; ++count; }
+          
+          if (count > 0)
+            aligned_depth_map_[idx] = static_cast<uint16_t>(sum / count);
+        }
+      }
+    }
+
+    // Create aligned depth image message
     aligned_depth_msg_.header.stamp.sec = current_time.sec;
     aligned_depth_msg_.header.stamp.nsec = current_time.nsec;
-    aligned_depth_msg_.header.frame_id = color_frame_id_; // Use color frame!
+    aligned_depth_msg_.header.frame_id = color_frame_id_;
 
     sensor_msgs::fillImage(aligned_depth_msg_, sensor_msgs::image_encodings::TYPE_16UC1,
-                          depth_cam_->ImageHeight(), depth_cam_->ImageWidth(),
-                          2 * depth_cam_->ImageWidth(),
-                          reinterpret_cast<const void*>(depth_map_.data()));
+                          color_height_, color_width_,
+                          2 * color_width_,
+                          reinterpret_cast<const void*>(aligned_depth_map_.data()));
 
-    // Generate camera info using COLOR camera parameters
-    auto aligned_info = CameraInfo(aligned_depth_msg_, color_cam_->HFOV().Radian());
+    // Use cached camera info (only update timestamp)
+    aligned_camera_info_.header = aligned_depth_msg_.header;
     
-    // Publish aligned depth with COLOR camera info
-    aligned_depth_pub_.publish(aligned_depth_msg_, aligned_info);
+    // Publish aligned depth with color camera info
+    aligned_depth_pub_.publish(aligned_depth_msg_, aligned_camera_info_);
   }
 
-  sensor_msgs::CameraInfo D435iGazeboPlugin::CameraInfo(const sensor_msgs::Image& image, float horizontal_fov)
+  sensor_msgs::CameraInfo D435iGazeboPlugin::CreateCameraInfoMsg(unsigned int width, unsigned int height,
+                                                                 float fx, float fy, float cx, float cy,
+                                                                 const std::string& frame_id)
   {
     sensor_msgs::CameraInfo info_msg;
 
-    info_msg.header = image.header;
+    info_msg.header.frame_id = frame_id;
     info_msg.distortion_model = "plumb_bob";
-    info_msg.height = image.height;
-    info_msg.width = image.width;
+    info_msg.height = height;
+    info_msg.width = width;
 
-    float focal = 0.5 * image.width / tan(0.5 * horizontal_fov);
+    // Distortion coefficients (assuming no distortion for simulation)
+    info_msg.D.resize(5, 0.0);
 
-    info_msg.K[0] = focal;  // fx
-    info_msg.K[4] = focal;  // fy
-    info_msg.K[2] = info_msg.width * 0.5;   // cx
-    info_msg.K[5] = info_msg.height * 0.5;  // cy
+    // Intrinsic camera matrix K
+    info_msg.K[0] = fx;  // fx
+    info_msg.K[1] = 0.0;
+    info_msg.K[2] = cx;  // cx
+    info_msg.K[3] = 0.0;
+    info_msg.K[4] = fy;  // fy
+    info_msg.K[5] = cy;  // cy
+    info_msg.K[6] = 0.0;
+    info_msg.K[7] = 0.0;
     info_msg.K[8] = 1.0;
 
-    info_msg.P[0] = info_msg.K[0];  // fx
-    info_msg.P[5] = info_msg.K[4];  // fy
-    info_msg.P[2] = info_msg.K[2];  // cx
-    info_msg.P[6] = info_msg.K[5];  // cy
-    info_msg.P[10] = info_msg.K[8]; // 1.0
+    // Rectification matrix R (identity for monocular camera)
+    info_msg.R[0] = 1.0;
+    info_msg.R[1] = 0.0;
+    info_msg.R[2] = 0.0;
+    info_msg.R[3] = 0.0;
+    info_msg.R[4] = 1.0;
+    info_msg.R[5] = 0.0;
+    info_msg.R[6] = 0.0;
+    info_msg.R[7] = 0.0;
+    info_msg.R[8] = 1.0;
+
+    // Projection matrix P
+    info_msg.P[0] = fx;   // fx
+    info_msg.P[1] = 0.0;
+    info_msg.P[2] = cx;   // cx
+    info_msg.P[3] = 0.0;  // Tx (0 for monocular)
+    info_msg.P[4] = 0.0;
+    info_msg.P[5] = fy;   // fy
+    info_msg.P[6] = cy;   // cy
+    info_msg.P[7] = 0.0;  // Ty (0 for monocular)
+    info_msg.P[8] = 0.0;
+    info_msg.P[9] = 0.0;
+    info_msg.P[10] = 1.0;
+    info_msg.P[11] = 0.0;
 
     return info_msg;
   }

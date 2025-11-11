@@ -16,6 +16,8 @@
   <build_depend>sensor_msgs</build_depend>
   <build_depend>image_transport</build_depend>
   <build_depend>camera_info_manager</build_depend>
+  <build_depend>tf2_ros</build_depend>
+  <build_depend>tf2_geometry_msgs</build_depend>
 
   <exec_depend>gazebo_ros</exec_depend>
   <exec_depend>xacro</exec_depend>
@@ -24,5 +26,7 @@
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>image_transport</exec_depend>
   <exec_depend>camera_info_manager</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
 
 </package>

@@ -7,7 +7,8 @@
 
 #include <gazebo/gazebo.hh>
 #include <gazebo/common/common.hh>
-#include <gazebo/physics/physics.hh>
+#include <gazebo/physics/Model.hh>
+#include <gazebo/physics/World.hh>
 #include <gazebo/sensors/sensors.hh>
 #include <gazebo/rendering/rendering.hh>
 #include <ros/ros.h>
@@ -15,7 +16,9 @@
 #include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/fill_image.h>
 #include <image_transport/image_transport.h>
-#include <camera_info_manager/camera_info_manager.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <geometry_msgs/TransformStamped.h>
 
 namespace gazebo
 {
@@ -27,7 +30,6 @@ namespace gazebo
 
     // Gazebo plugin interface
     virtual void Load(physics::ModelPtr _parent, sdf::ElementPtr _sdf);
-    virtual void OnUpdate();
 
   private:
     // Camera callbacks
@@ -35,8 +37,11 @@ namespace gazebo
     void OnNewDepthFrame();
 
     // Helper functions
-    sensor_msgs::CameraInfo CameraInfo(const sensor_msgs::Image& image, float horizontal_fov);
     void GenerateAlignedDepthToColor();
+    bool InitializeCameraParameters();
+    sensor_msgs::CameraInfo CreateCameraInfoMsg(unsigned int width, unsigned int height,
+                                                float fx, float fy, float cx, float cy,
+                                                const std::string& frame_id);
 
     // Gazebo components
     physics::ModelPtr model_;
@@ -49,7 +54,6 @@ namespace gazebo
     // Connections
     event::ConnectionPtr color_connection_;
     event::ConnectionPtr depth_connection_;
-    event::ConnectionPtr update_connection_;
 
     // ROS components
     ros::NodeHandle* nh_;
@@ -57,17 +61,16 @@ namespace gazebo
     image_transport::CameraPublisher color_pub_;
     image_transport::CameraPublisher depth_pub_;
     image_transport::CameraPublisher aligned_depth_pub_;
-    
-    // Camera info managers
-    boost::shared_ptr<camera_info_manager::CameraInfoManager> color_info_manager_;
-    boost::shared_ptr<camera_info_manager::CameraInfoManager> depth_info_manager_;
+
+    // TF listener for camera extrinsics
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     // Parameters
     std::string robot_namespace_;
     std::string camera_name_;
     std::string color_frame_id_;
     std::string depth_frame_id_;
-    double update_rate_;
     
     // Image data
     sensor_msgs::Image color_msg_;
@@ -76,9 +79,28 @@ namespace gazebo
     
     // Depth map for processing
     std::vector<uint16_t> depth_map_;
+    std::vector<uint16_t> aligned_depth_map_;
     
-    // Timing
-    common::Time last_update_time_;
+    // Cached camera info messages (static, created once)
+    sensor_msgs::CameraInfo depth_camera_info_;
+    sensor_msgs::CameraInfo color_camera_info_;
+    sensor_msgs::CameraInfo aligned_camera_info_;
+    
+    // Cached image dimensions
+    unsigned int depth_width_, depth_height_;
+    unsigned int color_width_, color_height_;
+    
+    // Camera parameters (cached)
+    bool params_initialized_;
+    
+    // Depth camera intrinsics
+    float depth_fx_, depth_fy_, depth_cx_, depth_cy_;
+    
+    // Color camera intrinsics
+    float color_fx_, color_fy_, color_cx_, color_cy_;
+    
+    // Camera extrinsics (depth to color transform - translation only)
+    double tx_, ty_, tz_;
     
     // Configuration
     bool initialized_;

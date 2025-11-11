@@ -10,6 +10,8 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   image_transport
   camera_info_manager
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 find_package(gazebo REQUIRED)
@@ -27,6 +29,8 @@ catkin_package(
     sensor_msgs 
     image_transport 
     camera_info_manager
+    tf2_ros
+    tf2_geometry_msgs
   DEPENDS 
     gazebo
 )
